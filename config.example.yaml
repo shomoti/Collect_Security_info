@@ -1,0 +1,79 @@
+﻿jira:
+  base_url: "https://your-domain.atlassian.net"
+  email_env: "JIRA_EMAIL"
+  token_env: "JIRA_API_TOKEN"
+  project_key: "CTI"
+  issue_types:
+    intel: "Intel Item"
+    validation: "Validation"
+  fields:
+    intel:
+      source: "customfield_10010"
+      source_url: "customfield_10011"
+      published_at: "customfield_10012"
+      language: "customfield_10013"
+      content_type: "customfield_10014"
+      cve_list: "customfield_10015"
+      products: "customfield_10016"
+      exploit_status: "customfield_10017"
+      impact_score: "customfield_10018"
+      confidence: "customfield_10019"
+      tldr: "customfield_10020"
+      key_points: "customfield_10021"
+      sigma_rule: "customfield_10022"
+    validation:
+      target_platform: "customfield_10030"
+      validation_type: "customfield_10031"
+      cve_primary: "customfield_10032"
+      affected_product: "customfield_10033"
+      exploit_status: "customfield_10034"
+      impact_score: "customfield_10035"
+      scope: "customfield_10036"
+      auto_route: "customfield_10037"
+      result: "customfield_10038"
+
+llm:
+  base_url: "http://localhost:8000/v1"
+  model: "local-model"
+  api_key_env: "LLM_API_KEY"
+  temperature: 0.2
+  timeout_seconds: 60
+  max_retries: 3
+
+rss:
+  timeout_seconds: 20
+  max_articles_per_run: 100
+  content_max_chars: 20000
+  sources:
+    - name: "Example Blog"
+      url: "https://example.com/feed"
+
+sigma:
+  output_format: "yaml"
+  max_rules_per_article: 3
+  enable_validation: true
+
+runtime:
+  db_path: "./state.db"
+  log_level: "INFO"
+  run_actor: "local-user"
+
+retry:
+  jira_max_retries: 3
+  jira_backoff_seconds: 2
+
+dedupe:
+  enable_content_hash: true
+  enable_title_similarity: true
+  title_similarity_threshold: 0.92
+  content_similarity_threshold: 0.9
+  min_title_length: 24
+
+impact_scoring:
+  base_score: 20
+  vulnerability_bonus: 20
+  exploit_bonus: 30
+  cve_per_item_bonus: 5
+  cve_max_bonus: 20
+  in_the_wild_bonus: 25
+  poc_bonus: 10

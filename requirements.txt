@@ -1,0 +1,4 @@
+﻿requests>=2.32.0
+feedparser>=6.0.11
+PyYAML>=6.0.2
+trafilatura>=1.8.0

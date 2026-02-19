@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cti-collector"
+version = "0.1.0"
+description = "Security intel RSS collector with LLM summarization and Jira ticketing"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "requests>=2.32.0",
+  "feedparser>=6.0.11",
+  "PyYAML>=6.0.2",
+  "trafilatura>=1.8.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
