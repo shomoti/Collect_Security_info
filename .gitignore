@@ -5,3 +5,4 @@ venv/
 config.yaml
 state.db
 others/
+*.egg-info/
