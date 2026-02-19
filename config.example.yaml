@@ -18,6 +18,7 @@
       exploit_status: "customfield_10017"
       impact_score: "customfield_10018"
       confidence: "customfield_10019"
+      confidence_score: "customfield_10023"
       tldr: "customfield_10020"
       key_points: "customfield_10021"
       sigma_rule: "customfield_10022"
@@ -52,6 +53,8 @@ sigma:
   output_format: "yaml"
   max_rules_per_article: 3
   enable_validation: true
+  drop_invalid_rules: true
+  target_backends: ["splunk", "es-qs"]
 
 runtime:
   db_path: "./state.db"
@@ -77,3 +80,24 @@ impact_scoring:
   cve_max_bonus: 20
   in_the_wild_bonus: 25
   poc_bonus: 10
+
+update_strategy:
+  enable_issue_update: true
+  match_order: ["source_url", "cve", "title_content_similarity"]
+  update_mode: "merge"
+  min_score_delta_for_comment: 10
+
+ioc:
+  enable_regex_extraction: true
+  dedupe_case_insensitive: true
+  max_items_per_type: 200
+
+confidence_scoring:
+  base: 40
+  source_reputation_bonus: 15
+  cve_present_bonus: 15
+  evidence_count_bonus: 10
+  has_poc_bonus: 10
+  in_the_wild_bonus: 15
+  max_score: 100
+  source_reputation: {}

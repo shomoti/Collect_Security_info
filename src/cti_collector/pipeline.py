@@ -8,11 +8,13 @@ import re
 from typing import Any
 from difflib import SequenceMatcher
 
-from .config import AppConfig, ImpactScoringConfig, getenv_required
+from .config import AppConfig, ConfidenceScoringConfig, IOCConfig, ImpactScoringConfig, getenv_required
+from .ioc import merge_iocs
 from .jira import JiraClient
 from .llm import LLMClient
 from .models import validate_llm_output
 from .rss import Article, collect_articles
+from .sigma_validate import validate_sigma_rules
 from .storage import StateStore
 from .url_utils import normalize_url
 
@@ -22,6 +24,7 @@ class RunStats:
     fetched: int = 0
     processed: int = 0
     created: int = 0
+    updated: int = 0
     skipped: int = 0
     failed: int = 0
 
@@ -160,6 +163,49 @@ def _infer_impact_score(
     return max(0, min(100, score))
 
 
+def _infer_confidence(
+    article: Article,
+    cves: list[str],
+    exploit_status: str,
+    evidence: list[dict[str, Any]],
+    scoring: ConfidenceScoringConfig,
+) -> tuple[int, str, list[dict[str, Any]]]:
+    score = scoring.base
+    factors: list[dict[str, Any]] = [{"factor": "base", "weight": scoring.base, "reason": "baseline confidence"}]
+
+    source_bonus = _to_int(scoring.source_reputation.get(article.source, 0), 0)
+    if source_bonus:
+        score += source_bonus
+        factors.append({"factor": "source_reputation", "weight": source_bonus, "reason": f"source={article.source}"})
+    elif scoring.source_reputation_bonus:
+        score += scoring.source_reputation_bonus
+        factors.append(
+            {"factor": "source_reputation_default", "weight": scoring.source_reputation_bonus, "reason": "default source weight"}
+        )
+
+    if cves:
+        score += scoring.cve_present_bonus
+        factors.append({"factor": "cve_present", "weight": scoring.cve_present_bonus, "reason": "article contains CVE"})
+    if len(evidence) >= 2:
+        score += scoring.evidence_count_bonus
+        factors.append({"factor": "evidence_count", "weight": scoring.evidence_count_bonus, "reason": "multiple evidence items"})
+    if exploit_status == "poc":
+        score += scoring.has_poc_bonus
+        factors.append({"factor": "poc", "weight": scoring.has_poc_bonus, "reason": "PoC mentioned"})
+    if exploit_status == "in_the_wild":
+        score += scoring.in_the_wild_bonus
+        factors.append({"factor": "in_the_wild", "weight": scoring.in_the_wild_bonus, "reason": "active exploitation reported"})
+
+    score = max(0, min(scoring.max_score, score))
+    if score >= 75:
+        level = "high"
+    elif score >= 45:
+        level = "medium"
+    else:
+        level = "low"
+    return score, level, factors
+
+
 def _to_int(value: Any, default: int = 0) -> int:
     try:
         if isinstance(value, bool):
@@ -212,6 +258,8 @@ def _normalize_llm_result(
     allowed_tags: set[str],
     sigma_max_rules: int,
     impact_scoring: ImpactScoringConfig,
+    ioc_config: IOCConfig,
+    confidence_scoring: ConfidenceScoringConfig,
 ) -> dict[str, Any]:
     data = dict(llm_result) if isinstance(llm_result, dict) else {}
     article_text = f"{article.title}\n{article.summary}\n{article.content}"
@@ -255,18 +303,13 @@ def _normalize_llm_result(
     if not impact_score_factors:
         impact_score_factors = [{"factor": "article_context", "weight": 10, "reason": "Fallback factor from parsed article context"}]
 
-    iocs = data.get("iocs")
-    if not isinstance(iocs, dict):
-        iocs = {
-            "ips": [],
-            "domains": [],
-            "urls": [],
-            "hashes": [],
-            "emails": [],
-            "files": [],
-            "registry": [],
-            "mutexes": [],
-        }
+    iocs = merge_iocs(
+        llm_iocs=data.get("iocs", {}),
+        article_text=article_text,
+        enable_regex_extraction=ioc_config.enable_regex_extraction,
+        case_insensitive=ioc_config.dedupe_case_insensitive,
+        max_items_per_type=ioc_config.max_items_per_type,
+    )
 
     content_type = data.get("content_type") or _infer_content_type(article_text)
     exploit_status = data.get("exploit_status") or _infer_exploit_status(article_text)
@@ -274,6 +317,16 @@ def _normalize_llm_result(
     if impact_score_raw < 0:
         impact_score_raw = _infer_impact_score(content_type, exploit_status, cves, impact_scoring)
     impact_score = max(0, min(100, impact_score_raw))
+    confidence_score, confidence_level, confidence_factors = _infer_confidence(
+        article=article,
+        cves=cves,
+        exploit_status=exploit_status,
+        evidence=evidence,
+        scoring=confidence_scoring,
+    )
+    confidence_text = str(data.get("confidence") or confidence_level).lower()
+    if confidence_text not in {"low", "medium", "high"}:
+        confidence_text = confidence_level
 
     return {
         "title": title,
@@ -294,7 +347,9 @@ def _normalize_llm_result(
         "tags": tags,
         "impact_score": impact_score,
         "impact_score_factors": impact_score_factors,
-        "confidence": data.get("confidence") or "medium",
+        "confidence": confidence_text,
+        "confidence_score": confidence_score,
+        "confidence_factors": confidence_factors,
         "evidence": evidence,
         "sigma_rules": _coerce_sigma_rules(data.get("sigma_rules"), sigma_max_rules),
     }
@@ -322,6 +377,101 @@ def _quality_issues(result: dict[str, Any]) -> list[str]:
     if not _ensure_list(result.get("platforms")):
         issues.append("platforms should not be empty")
     return issues
+
+
+def _as_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if value is None:
+        return []
+    return [value]
+
+
+def _merge_unique(existing: Any, new: Any) -> list[Any]:
+    out: list[Any] = []
+    seen: set[str] = set()
+    for item in _as_list(existing) + _as_list(new):
+        key = json.dumps(item, ensure_ascii=False, sort_keys=True) if isinstance(item, (dict, list)) else str(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _safe_load_json(value: Any) -> Any:
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return json.loads(text)
+            except Exception:
+                return value
+    return value
+
+
+def _extract_intel_values_from_issue(issue_fields: dict[str, Any], intel_mapping: dict[str, str]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for logical_name, field_id in intel_mapping.items():
+        if field_id in issue_fields:
+            out[logical_name] = _safe_load_json(issue_fields.get(field_id))
+    return out
+
+
+def _merge_intel_payload(existing: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(new)
+    merged["cve_list"] = _merge_unique(existing.get("cve_list", []), new.get("cve_list", []))
+    merged["products"] = _merge_unique(existing.get("products", []), new.get("products", []))
+    merged["key_points"] = _merge_unique(existing.get("key_points", []), new.get("key_points", []))[:10]
+    merged["sigma_rule"] = _merge_unique(existing.get("sigma_rule", []), new.get("sigma_rule", []))[:10]
+    merged["impact_score"] = max(_to_int(existing.get("impact_score"), 0), _to_int(new.get("impact_score"), 0))
+    if existing.get("source_url"):
+        merged["source_url"] = existing["source_url"]
+    if existing.get("source"):
+        merged["source"] = existing["source"]
+    return merged
+
+
+def _build_update_comment(
+    article: Article,
+    old_score: int,
+    new_score: int,
+    old_cves: list[str],
+    new_cves: list[str],
+) -> str:
+    old_set = {str(x) for x in old_cves}
+    new_set = {str(x) for x in new_cves}
+    added_cves = sorted(new_set - old_set)
+    parts = [
+        "新着記事に基づきIntel Issueを更新しました。",
+        f"- article_url: {article.url}",
+        f"- article_title: {article.title}",
+        f"- impact_score: {old_score} -> {new_score}",
+    ]
+    if added_cves:
+        parts.append(f"- new_cves: {added_cves}")
+    return "\n".join(parts)
+
+
+def _apply_sigma_quality_gate(config: AppConfig, payload: dict[str, Any]) -> list[str]:
+    if not config.sigma.enable_validation:
+        return []
+    rules = payload.get("sigma_rules", [])
+    if not isinstance(rules, list):
+        payload["sigma_rules"] = []
+        return ["sigma_rules must be a list"]
+    valid_rules, errors = validate_sigma_rules(
+        rules=rules,
+        target_backends=config.sigma.target_backends,
+        drop_invalid_rules=config.sigma.drop_invalid_rules,
+    )
+    payload["sigma_rules"] = valid_rules
+    gate_errors: list[str] = []
+    if errors and not config.sigma.drop_invalid_rules:
+        gate_errors.extend(errors)
+    if not payload["sigma_rules"]:
+        gate_errors.append("sigma_rules empty after quality gate")
+    return gate_errors
 
 
 def _add_duplicate_comment(
@@ -382,6 +532,7 @@ def _build_issue_payloads(summary_data: dict[str, Any], article: Article) -> tup
         "exploit_status": summary_data.get("exploit_status", "unknown"),
         "impact_score": summary_data.get("impact_score", 0),
         "confidence": summary_data.get("confidence", "medium"),
+        "confidence_score": summary_data.get("confidence_score", 0),
         "tldr": summary_data.get("tldr", ""),
         "key_points": summary_data.get("key_points", []),
         "sigma_rule": summary_data.get("sigma_rules", []),
@@ -446,6 +597,12 @@ def run_daily(config: AppConfig, allowed_tags: set[str], prompt_path: str, enabl
                 stats.skipped += 1
                 continue
 
+            matched_intel_key = ""
+            matched_validation_key = ""
+            matched_update_count = 0
+            source_field = config.jira.fields.get("intel", {}).get("source_url", "")
+            cve_field = config.jira.fields.get("intel", {}).get("cve_list", "")
+
             if config.dedupe.enable_content_hash:
                 by_hash = store.find_by_content_hash(article.content_hash)
                 if by_hash and by_hash.jira_validation_key:
@@ -489,43 +646,56 @@ def run_daily(config: AppConfig, allowed_tags: set[str], prompt_path: str, enabl
                         matched_content_sim = content_sim
                         break
                 if matched:
-                    _add_duplicate_comment(
-                        logger=logger,
-                        jira=jira,
-                        intel_key=matched.jira_intel_key,
-                        article=article,
-                        reason="title_and_content_similarity",
-                        matched_url=matched.normalized_url,
-                        title_similarity=matched_sim,
-                        content_similarity=matched_content_sim,
-                    )
-                    store.save(
-                        normalized_url=normalized,
-                        jira_intel_key=matched.jira_intel_key,
-                        jira_validation_key=matched.jira_validation_key,
-                        content_hash=article.content_hash,
-                        source=article.source,
-                        title_norm=title_norm,
-                        content_fp=content_fp,
-                    )
-                    logger.info(
-                        "skip duplicate by title similarity",
-                        extra={"extra": {"url": normalized, "matched_url": matched.normalized_url}},
-                    )
-                    stats.skipped += 1
-                    continue
+                    if config.update_strategy.enable_issue_update and "title_content_similarity" in config.update_strategy.match_order:
+                        matched_intel_key = matched.jira_intel_key
+                        matched_validation_key = matched.jira_validation_key
+                        matched_update_count = matched.update_count
+                    else:
+                        _add_duplicate_comment(
+                            logger=logger,
+                            jira=jira,
+                            intel_key=matched.jira_intel_key,
+                            article=article,
+                            reason="title_and_content_similarity",
+                            matched_url=matched.normalized_url,
+                            title_similarity=matched_sim,
+                            content_similarity=matched_content_sim,
+                        )
+                        store.save(
+                            normalized_url=normalized,
+                            jira_intel_key=matched.jira_intel_key,
+                            jira_validation_key=matched.jira_validation_key,
+                            content_hash=article.content_hash,
+                            source=article.source,
+                            title_norm=title_norm,
+                            content_fp=content_fp,
+                            canonical_key=matched.jira_intel_key,
+                            update_count=matched.update_count,
+                        )
+                        logger.info(
+                            "skip duplicate by title similarity",
+                            extra={"extra": {"url": normalized, "matched_url": matched.normalized_url}},
+                        )
+                        stats.skipped += 1
+                        continue
 
             try:
-                if enable_jql_fallback:
-                    source_field = config.jira.fields.get("intel", {}).get("source_url", "")
-                    if source_field:
-                        try:
-                            existing_key = jira.search_existing_intel_by_source_url(
-                                issue_type=config.jira.issue_types["intel"],
-                                source_url=normalized,
-                                source_field_id=source_field,
-                            )
-                            if existing_key:
+                if (
+                    enable_jql_fallback
+                    and source_field
+                    and not matched_intel_key
+                    and "source_url" in config.update_strategy.match_order
+                ):
+                    try:
+                        existing_key = jira.search_existing_intel_by_source_url(
+                            issue_type=config.jira.issue_types["intel"],
+                            source_url=normalized,
+                            source_field_id=source_field,
+                        )
+                        if existing_key:
+                            if config.update_strategy.enable_issue_update:
+                                matched_intel_key = existing_key
+                            else:
                                 _add_duplicate_comment(
                                     logger=logger,
                                     jira=jira,
@@ -536,11 +706,11 @@ def run_daily(config: AppConfig, allowed_tags: set[str], prompt_path: str, enabl
                                 )
                                 stats.skipped += 1
                                 continue
-                        except Exception as exc:
-                            logger.warning(
-                                "jql duplicate check failed; continue without jql fallback",
-                                extra={"extra": {"url": normalized, "error": str(exc)}},
-                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "jql duplicate check failed; continue without jql fallback",
+                            extra={"extra": {"url": normalized, "error": str(exc)}},
+                        )
 
                 user_prompt = _build_user_prompt(
                     article=article,
@@ -555,10 +725,13 @@ def run_daily(config: AppConfig, allowed_tags: set[str], prompt_path: str, enabl
                     allowed_tags=allowed_tags,
                     sigma_max_rules=config.sigma.max_rules_per_article,
                     impact_scoring=config.impact_scoring,
+                    ioc_config=config.ioc,
+                    confidence_scoring=config.confidence_scoring,
                 )
 
+                sigma_errors = _apply_sigma_quality_gate(config, llm_result)
                 validation = validate_llm_output(llm_result, allowed_tags)
-                quality_errors = _quality_issues(llm_result)
+                quality_errors = _quality_issues(llm_result) + sigma_errors
                 if (not validation.ok) or quality_errors:
                     all_errors = validation.errors + quality_errors
                     repair_prompt = _build_repair_prompt(article=article, current_output=llm_result, errors=all_errors)
@@ -569,41 +742,108 @@ def run_daily(config: AppConfig, allowed_tags: set[str], prompt_path: str, enabl
                         allowed_tags=allowed_tags,
                         sigma_max_rules=config.sigma.max_rules_per_article,
                         impact_scoring=config.impact_scoring,
+                        ioc_config=config.ioc,
+                        confidence_scoring=config.confidence_scoring,
                     )
+                    sigma_errors = _apply_sigma_quality_gate(config, llm_result)
                     validation = validate_llm_output(llm_result, allowed_tags)
-                    quality_errors = _quality_issues(llm_result)
+                    quality_errors = _quality_issues(llm_result) + sigma_errors
                     if (not validation.ok) or quality_errors:
                         raise ValueError(f"LLM output validation failed: {validation.errors + quality_errors}")
 
                 tags = llm_result.get("tags", [])
                 intel_fields, validation_fields, intel_summary, combined_desc = _build_issue_payloads(llm_result, article)
 
-                intel_key = jira.create_intel_issue(
-                    summary=intel_summary,
-                    description=combined_desc,
-                    labels=tags,
-                    intel=intel_fields,
-                )
-                validation_summary = f"[{intel_key}] Validation: {llm_result.get('title', article.title)}"
-                validation_key = jira.create_validation_issue(
-                    summary=validation_summary,
-                    description=combined_desc,
-                    labels=tags,
-                    validation=validation_fields,
-                )
-                jira.link_validation_to_intel(validation_key=validation_key, intel_key=intel_key)
-                store.save(
-                    normalized_url=normalized,
-                    jira_intel_key=intel_key,
-                    jira_validation_key=validation_key,
-                    content_hash=article.content_hash,
-                    source=article.source,
-                    title_norm=title_norm,
-                    content_fp=content_fp,
-                )
+                if (
+                    config.update_strategy.enable_issue_update
+                    and not matched_intel_key
+                    and cve_field
+                    and "cve" in config.update_strategy.match_order
+                ):
+                    try:
+                        matched_intel_key = (
+                            jira.search_existing_intel_by_cves(
+                                issue_type=config.jira.issue_types["intel"],
+                                cves=llm_result.get("cves", []),
+                                cve_field_id=cve_field,
+                            )
+                            or ""
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "jql cve match failed; continue without cve update match",
+                            extra={"extra": {"url": normalized, "error": str(exc)}},
+                        )
 
-                stats.processed += 1
-                stats.created += 1
+                if matched_intel_key and config.update_strategy.enable_issue_update:
+                    issue_fields = jira.get_issue_fields(
+                        matched_intel_key,
+                        list(config.jira.fields.get("intel", {}).values()),
+                    )
+                    existing_intel = _extract_intel_values_from_issue(issue_fields, config.jira.fields.get("intel", {}))
+                    old_score = _to_int(existing_intel.get("impact_score"), 0)
+                    old_cves = [str(x) for x in _ensure_list(existing_intel.get("cve_list"))]
+                    final_intel_fields = intel_fields
+                    if config.update_strategy.update_mode == "merge":
+                        final_intel_fields = _merge_intel_payload(existing_intel, intel_fields)
+                    new_score = _to_int(final_intel_fields.get("impact_score"), 0)
+                    new_cves = [str(x) for x in _ensure_list(final_intel_fields.get("cve_list"))]
+
+                    jira.update_intel_issue(
+                        issue_key=matched_intel_key,
+                        summary=intel_summary,
+                        description=combined_desc,
+                        labels=tags,
+                        intel=final_intel_fields,
+                    )
+                    score_delta = abs(new_score - old_score)
+                    has_new_cves = bool(set(new_cves) - set(old_cves))
+                    if score_delta >= config.update_strategy.min_score_delta_for_comment or has_new_cves:
+                        jira.add_comment(
+                            matched_intel_key,
+                            _build_update_comment(article, old_score, new_score, old_cves, new_cves),
+                        )
+                    store.save(
+                        normalized_url=normalized,
+                        jira_intel_key=matched_intel_key,
+                        jira_validation_key=matched_validation_key,
+                        content_hash=article.content_hash,
+                        source=article.source,
+                        title_norm=title_norm,
+                        content_fp=content_fp,
+                        canonical_key=matched_intel_key,
+                        update_count=matched_update_count + 1,
+                    )
+                    stats.processed += 1
+                    stats.updated += 1
+                else:
+                    intel_key = jira.create_intel_issue(
+                        summary=intel_summary,
+                        description=combined_desc,
+                        labels=tags,
+                        intel=intel_fields,
+                    )
+                    validation_summary = f"[{intel_key}] Validation: {llm_result.get('title', article.title)}"
+                    validation_key = jira.create_validation_issue(
+                        summary=validation_summary,
+                        description=combined_desc,
+                        labels=tags,
+                        validation=validation_fields,
+                    )
+                    jira.link_validation_to_intel(validation_key=validation_key, intel_key=intel_key)
+                    store.save(
+                        normalized_url=normalized,
+                        jira_intel_key=intel_key,
+                        jira_validation_key=validation_key,
+                        content_hash=article.content_hash,
+                        source=article.source,
+                        title_norm=title_norm,
+                        content_fp=content_fp,
+                        canonical_key=intel_key,
+                        update_count=0,
+                    )
+                    stats.processed += 1
+                    stats.created += 1
             except Exception as exc:
                 logger.error(
                     "article processing failed",

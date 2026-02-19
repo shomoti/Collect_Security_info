@@ -140,6 +140,30 @@ class JiraClient:
         payload = {"body": self._adf_paragraph(text)}
         self._request_with_retry("POST", f"/rest/api/3/issue/{issue_key}/comment", payload)
 
+    def get_issue_fields(self, issue_key: str, field_ids: list[str]) -> dict[str, Any]:
+        url = f"{self.base_url}/rest/api/3/issue/{issue_key}"
+        params = {"fields": ",".join(field_ids)} if field_ids else {}
+        resp = self.session.get(url, params=params, timeout=30)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"jira status: {resp.status_code} body={self._response_body(resp)}")
+        data = resp.json() if resp.text.strip() else {}
+        fields = data.get("fields", {})
+        if not isinstance(fields, dict):
+            return {}
+        return fields
+
+    def update_intel_issue(self, issue_key: str, summary: str, description: str, labels: list[str], intel: dict[str, Any]) -> None:
+        mapped = self._map_fields("intel", intel)
+        payload = {
+            "fields": {
+                "summary": summary[:255],
+                "description": self._adf_paragraph(description),
+                "labels": labels,
+                **mapped,
+            }
+        }
+        self._request_with_retry("PUT", f"/rest/api/3/issue/{issue_key}", payload)
+
     def link_validation_to_intel(self, validation_key: str, intel_key: str) -> None:
         payload = {
             "type": {"name": "Relates"},
@@ -167,6 +191,29 @@ class JiraClient:
             issues = data.get("issues", [])
             if issues:
                 return str(issues[0]["key"])
+        return None
+
+    def search_existing_intel_by_cves(self, issue_type: str, cves: list[str], cve_field_id: str) -> str | None:
+        if not cves:
+            return None
+        field_expr = self._to_jql_field_expr(cve_field_id)
+        for cve in cves:
+            escaped_cve = cve.replace('"', "")
+            operators = ["=", "~"]
+            for operator in operators:
+                jql = (
+                    f'project = "{self.project_key}" '
+                    f'AND issuetype = "{issue_type}" '
+                    f'AND {field_expr} {operator} "{escaped_cve}"'
+                )
+                payload = {"jql": jql, "maxResults": 1, "fields": ["key"]}
+                try:
+                    data = self._request_with_retry("POST", "/rest/api/3/search/jql", payload)
+                except Exception:
+                    continue
+                issues = data.get("issues", [])
+                if issues:
+                    return str(issues[0]["key"])
         return None
 
     def _to_jql_field_expr(self, field_id: str) -> str:

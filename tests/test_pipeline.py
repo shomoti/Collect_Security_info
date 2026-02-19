@@ -30,7 +30,13 @@ def _make_config(tmp_path):
             content_max_chars=20000,
             sources=[{"name": "A", "url": "https://example.com/feed"}],
         ),
-        sigma=SimpleNamespace(output_format="yaml", max_rules_per_article=2, enable_validation=True),
+        sigma=SimpleNamespace(
+            output_format="yaml",
+            max_rules_per_article=2,
+            enable_validation=True,
+            drop_invalid_rules=True,
+            target_backends=[],
+        ),
         runtime=SimpleNamespace(db_path=str(tmp_path / "state.db"), log_level="INFO", run_actor="tester"),
         retry=SimpleNamespace(jira_max_retries=1, jira_backoff_seconds=1),
         dedupe=SimpleNamespace(
@@ -48,6 +54,27 @@ def _make_config(tmp_path):
             cve_max_bonus=20,
             in_the_wild_bonus=25,
             poc_bonus=10,
+        ),
+        confidence_scoring=SimpleNamespace(
+            base=40,
+            source_reputation_bonus=15,
+            cve_present_bonus=15,
+            evidence_count_bonus=10,
+            has_poc_bonus=10,
+            in_the_wild_bonus=15,
+            max_score=100,
+            source_reputation={},
+        ),
+        update_strategy=SimpleNamespace(
+            enable_issue_update=True,
+            match_order=["source_url", "cve", "title_content_similarity"],
+            update_mode="merge",
+            min_score_delta_for_comment=10,
+        ),
+        ioc=SimpleNamespace(
+            enable_regex_extraction=True,
+            dedupe_case_insensitive=True,
+            max_items_per_type=200,
         ),
     )
 
@@ -73,6 +100,8 @@ def _llm_result(url: str) -> dict:
         "impact_score": 50,
         "impact_score_factors": [{"factor": "f", "weight": 10, "reason": "r"}],
         "confidence": "medium",
+        "confidence_score": 60,
+        "confidence_factors": [{"factor": "source", "weight": 10, "reason": "known"}],
         "evidence": [{"claim": "c", "basis": "b"}],
         "sigma_rules": [{"title": "r1", "logsource": {"product": "windows"}, "detection": {"a": 1}, "condition": "a"}],
     }
@@ -122,6 +151,17 @@ def test_run_daily_creates_and_links_issues(monkeypatch, tmp_path) -> None:
         def add_comment(self, issue_key, text):
             self.calls.append(("comment", issue_key, text))
 
+        def search_existing_intel_by_cves(self, issue_type, cves, cve_field_id):
+            self.calls.append(("search_cve", tuple(cves)))
+            return None
+
+        def get_issue_fields(self, issue_key, field_ids):
+            self.calls.append(("get_issue", issue_key))
+            return {}
+
+        def update_intel_issue(self, issue_key, summary, description, labels, intel):
+            self.calls.append(("update_intel", issue_key, labels, intel))
+
     jira = DummyJira()
     monkeypatch.setattr("cti_collector.pipeline.LLMClient", lambda **kwargs: DummyLLM())
     monkeypatch.setattr("cti_collector.pipeline.JiraClient", lambda **kwargs: jira)
@@ -138,6 +178,7 @@ def test_run_daily_creates_and_links_issues(monkeypatch, tmp_path) -> None:
 
 def test_run_daily_skips_when_already_processed(monkeypatch, tmp_path) -> None:
     config = _make_config(tmp_path)
+    config.update_strategy.enable_issue_update = False
     prompt_path = tmp_path / "prompt.txt"
     prompt_path.write_text("system", encoding="utf-8")
 
@@ -163,6 +204,15 @@ def test_run_daily_skips_when_already_processed(monkeypatch, tmp_path) -> None:
             return "CTI-EXIST"
 
         def add_comment(self, issue_key, text):
+            return None
+
+        def search_existing_intel_by_cves(self, issue_type, cves, cve_field_id):
+            return None
+
+        def get_issue_fields(self, issue_key, field_ids):
+            return {}
+
+        def update_intel_issue(self, issue_key, summary, description, labels, intel):
             return None
 
     monkeypatch.setattr("cti_collector.pipeline.LLMClient", lambda **kwargs: DummyLLM())
@@ -204,12 +254,28 @@ def test_normalize_llm_result_fills_missing_required_fields() -> None:
             in_the_wild_bonus=25,
             poc_bonus=10,
         ),
+        ioc_config=SimpleNamespace(
+            enable_regex_extraction=True,
+            dedupe_case_insensitive=True,
+            max_items_per_type=200,
+        ),
+        confidence_scoring=SimpleNamespace(
+            base=40,
+            source_reputation_bonus=15,
+            cve_present_bonus=15,
+            evidence_count_bonus=10,
+            has_poc_bonus=10,
+            in_the_wild_bonus=15,
+            max_score=100,
+            source_reputation={},
+        ),
     )
 
     assert normalized["title"] == "Test advisory"
     assert normalized["source"] == "CISA"
     assert normalized["source_url"] == "https://example.com/a"
     assert normalized["impact_score"] == 42
+    assert 0 <= normalized["confidence_score"] <= 100
     assert normalized["tags"] == ["type_research"]
     assert isinstance(normalized["sigma_rules"], list)
     assert isinstance(normalized["sigma_rules"][0], dict)
@@ -238,6 +304,21 @@ def test_normalize_llm_result_infers_cve_platforms_and_key_points() -> None:
             cve_max_bonus=20,
             in_the_wild_bonus=25,
             poc_bonus=10,
+        ),
+        ioc_config=SimpleNamespace(
+            enable_regex_extraction=True,
+            dedupe_case_insensitive=True,
+            max_items_per_type=200,
+        ),
+        confidence_scoring=SimpleNamespace(
+            base=40,
+            source_reputation_bonus=15,
+            cve_present_bonus=15,
+            evidence_count_bonus=10,
+            has_poc_bonus=10,
+            in_the_wild_bonus=15,
+            max_score=100,
+            source_reputation={},
         ),
     )
 
@@ -296,6 +377,15 @@ def test_run_daily_skips_duplicate_by_content_hash(monkeypatch, tmp_path) -> Non
         def add_comment(self, issue_key, text):
             return None
 
+        def search_existing_intel_by_cves(self, issue_type, cves, cve_field_id):
+            return None
+
+        def get_issue_fields(self, issue_key, field_ids):
+            return {}
+
+        def update_intel_issue(self, issue_key, summary, description, labels, intel):
+            return None
+
     monkeypatch.setattr("cti_collector.pipeline.LLMClient", lambda **kwargs: DummyLLM())
     monkeypatch.setattr("cti_collector.pipeline.JiraClient", lambda **kwargs: DummyJira())
 
@@ -308,6 +398,7 @@ def test_run_daily_skips_duplicate_by_content_hash(monkeypatch, tmp_path) -> Non
 
 def test_run_daily_skips_duplicate_by_title_similarity(monkeypatch, tmp_path) -> None:
     config = _make_config(tmp_path)
+    config.update_strategy.enable_issue_update = False
     config.dedupe.title_similarity_threshold = 0.8
     config.dedupe.content_similarity_threshold = 0.8
     prompt_path = tmp_path / "prompt.txt"
@@ -360,6 +451,15 @@ def test_run_daily_skips_duplicate_by_title_similarity(monkeypatch, tmp_path) ->
         def add_comment(self, issue_key, text):
             self.comments.append((issue_key, text))
 
+        def search_existing_intel_by_cves(self, issue_type, cves, cve_field_id):
+            return None
+
+        def get_issue_fields(self, issue_key, field_ids):
+            return {}
+
+        def update_intel_issue(self, issue_key, summary, description, labels, intel):
+            return None
+
     jira = DummyJira()
     monkeypatch.setattr("cti_collector.pipeline.LLMClient", lambda **kwargs: DummyLLM())
     monkeypatch.setattr("cti_collector.pipeline.JiraClient", lambda **kwargs: jira)
@@ -371,3 +471,72 @@ def test_run_daily_skips_duplicate_by_title_similarity(monkeypatch, tmp_path) ->
     assert calls["llm"] == 1
     assert len(jira.comments) == 1
     assert jira.comments[0][0] == "CTI-1"
+
+
+def test_run_daily_updates_existing_intel_by_source_url(monkeypatch, tmp_path) -> None:
+    config = _make_config(tmp_path)
+    prompt_path = tmp_path / "prompt.txt"
+    prompt_path.write_text("system", encoding="utf-8")
+
+    article = Article(
+        source="A",
+        title="Updated advisory",
+        url="https://example.com/update",
+        published_at="2026-02-19",
+        summary="s",
+        content="Windows CVE-2025-1234 actively exploited in the wild",
+        content_hash="h-upd",
+    )
+
+    monkeypatch.setattr("cti_collector.pipeline.getenv_required", lambda name: "dummy")
+    monkeypatch.setattr("cti_collector.pipeline.collect_articles", lambda **kwargs: [article])
+
+    class DummyLLM:
+        def summarize(self, user_prompt: str):
+            return _llm_result("https://example.com/update")
+
+    class DummyJira:
+        def __init__(self):
+            self.updated = []
+            self.comments = []
+
+        def search_existing_intel_by_source_url(self, issue_type, source_url, source_field_id):
+            return "CTI-EXIST"
+
+        def search_existing_intel_by_cves(self, issue_type, cves, cve_field_id):
+            return None
+
+        def get_issue_fields(self, issue_key, field_ids):
+            return {
+                "customfield_10015": '["CVE-2025-1234"]',
+                "customfield_10016": '["oldProduct"]',
+                "customfield_10018": 30,
+                "customfield_10021": '["old"]',
+                "customfield_10022": "[]",
+            }
+
+        def update_intel_issue(self, issue_key, summary, description, labels, intel):
+            self.updated.append((issue_key, summary, labels, intel))
+
+        def add_comment(self, issue_key, text):
+            self.comments.append((issue_key, text))
+
+        def create_intel_issue(self, summary, description, labels, intel):
+            raise AssertionError("should not create new issue")
+
+        def create_validation_issue(self, summary, description, labels, validation):
+            raise AssertionError("should not create validation issue")
+
+        def link_validation_to_intel(self, validation_key, intel_key):
+            raise AssertionError("should not link on update")
+
+    jira = DummyJira()
+    monkeypatch.setattr("cti_collector.pipeline.LLMClient", lambda **kwargs: DummyLLM())
+    monkeypatch.setattr("cti_collector.pipeline.JiraClient", lambda **kwargs: jira)
+
+    stats = run_daily(config, {"plat_windows", "type_vuln"}, str(prompt_path), enable_jql_fallback=True)
+
+    assert stats.fetched == 1
+    assert stats.updated == 1
+    assert stats.created == 0
+    assert len(jira.updated) == 1

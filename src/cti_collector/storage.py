@@ -15,6 +15,9 @@ class StoredRecord:
     source: str
     title_norm: str
     content_fp: str
+    last_seen_at: str
+    canonical_key: str
+    update_count: int
 
 
 class StateStore:
@@ -30,15 +33,22 @@ class StateStore:
                 fetched_at TEXT,
                 source TEXT DEFAULT '',
                 title_norm TEXT DEFAULT '',
-                content_fp TEXT DEFAULT ''
+                content_fp TEXT DEFAULT '',
+                last_seen_at TEXT DEFAULT '',
+                canonical_key TEXT DEFAULT '',
+                update_count INTEGER DEFAULT 0
             )
             """
         )
         self._ensure_column("source", "TEXT DEFAULT ''")
         self._ensure_column("title_norm", "TEXT DEFAULT ''")
         self._ensure_column("content_fp", "TEXT DEFAULT ''")
+        self._ensure_column("last_seen_at", "TEXT DEFAULT ''")
+        self._ensure_column("canonical_key", "TEXT DEFAULT ''")
+        self._ensure_column("update_count", "INTEGER DEFAULT 0")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_content_hash ON processed_articles(content_hash)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_source_title ON processed_articles(source, title_norm)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_canonical_key ON processed_articles(canonical_key)")
         self.conn.commit()
 
     def _ensure_column(self, column_name: str, definition: str) -> None:
@@ -50,7 +60,8 @@ class StateStore:
 
     def get(self, normalized_url: str) -> StoredRecord | None:
         row = self.conn.execute(
-            "SELECT normalized_url, jira_intel_key, jira_validation_key, content_hash, fetched_at, source, title_norm, content_fp "
+            "SELECT normalized_url, jira_intel_key, jira_validation_key, content_hash, fetched_at, source, title_norm, content_fp, "
+            "last_seen_at, canonical_key, update_count "
             "FROM processed_articles WHERE normalized_url = ?",
             (normalized_url,),
         ).fetchone()
@@ -60,7 +71,8 @@ class StateStore:
 
     def find_by_content_hash(self, content_hash: str) -> StoredRecord | None:
         row = self.conn.execute(
-            "SELECT normalized_url, jira_intel_key, jira_validation_key, content_hash, fetched_at, source, title_norm, content_fp "
+            "SELECT normalized_url, jira_intel_key, jira_validation_key, content_hash, fetched_at, source, title_norm, content_fp, "
+            "last_seen_at, canonical_key, update_count "
             "FROM processed_articles WHERE content_hash = ? AND jira_validation_key != '' "
             "ORDER BY fetched_at DESC LIMIT 1",
             (content_hash,),
@@ -71,7 +83,8 @@ class StateStore:
 
     def iter_by_source(self, source: str) -> list[StoredRecord]:
         rows = self.conn.execute(
-            "SELECT normalized_url, jira_intel_key, jira_validation_key, content_hash, fetched_at, source, title_norm, content_fp "
+            "SELECT normalized_url, jira_intel_key, jira_validation_key, content_hash, fetched_at, source, title_norm, content_fp, "
+            "last_seen_at, canonical_key, update_count "
             "FROM processed_articles WHERE source = ?",
             (source,),
         ).fetchall()
@@ -86,22 +99,42 @@ class StateStore:
         source: str = "",
         title_norm: str = "",
         content_fp: str = "",
+        canonical_key: str = "",
+        update_count: int = 0,
     ) -> None:
         fetched_at = datetime.now(timezone.utc).isoformat()
         self.conn.execute(
             """
-            INSERT INTO processed_articles (normalized_url, jira_intel_key, jira_validation_key, content_hash, fetched_at, source, title_norm, content_fp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO processed_articles (
+              normalized_url, jira_intel_key, jira_validation_key, content_hash, fetched_at, source, title_norm, content_fp,
+              last_seen_at, canonical_key, update_count
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(normalized_url) DO UPDATE SET
               jira_intel_key = excluded.jira_intel_key,
               jira_validation_key = excluded.jira_validation_key,
               content_hash = excluded.content_hash,
               fetched_at = excluded.fetched_at,
+              last_seen_at = excluded.last_seen_at,
               source = excluded.source,
               title_norm = excluded.title_norm,
-              content_fp = excluded.content_fp
+              content_fp = excluded.content_fp,
+              canonical_key = excluded.canonical_key,
+              update_count = excluded.update_count
             """,
-            (normalized_url, jira_intel_key, jira_validation_key, content_hash, fetched_at, source, title_norm, content_fp),
+            (
+                normalized_url,
+                jira_intel_key,
+                jira_validation_key,
+                content_hash,
+                fetched_at,
+                source,
+                title_norm,
+                content_fp,
+                fetched_at,
+                canonical_key,
+                update_count,
+            ),
         )
         self.conn.commit()
 

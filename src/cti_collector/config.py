@@ -41,6 +41,8 @@ class SigmaConfig:
     output_format: str
     max_rules_per_article: int
     enable_validation: bool
+    drop_invalid_rules: bool
+    target_backends: list[str]
 
 
 @dataclass
@@ -77,6 +79,33 @@ class ImpactScoringConfig:
 
 
 @dataclass
+class UpdateStrategyConfig:
+    enable_issue_update: bool
+    match_order: list[str]
+    update_mode: str
+    min_score_delta_for_comment: int
+
+
+@dataclass
+class IOCConfig:
+    enable_regex_extraction: bool
+    dedupe_case_insensitive: bool
+    max_items_per_type: int
+
+
+@dataclass
+class ConfidenceScoringConfig:
+    base: int
+    source_reputation_bonus: int
+    cve_present_bonus: int
+    evidence_count_bonus: int
+    has_poc_bonus: int
+    in_the_wild_bonus: int
+    max_score: int
+    source_reputation: dict[str, int]
+
+
+@dataclass
 class AppConfig:
     jira: JiraConfig
     llm: LLMConfig
@@ -86,6 +115,9 @@ class AppConfig:
     retry: RetryConfig
     dedupe: DedupeConfig
     impact_scoring: ImpactScoringConfig
+    confidence_scoring: ConfidenceScoringConfig
+    update_strategy: UpdateStrategyConfig
+    ioc: IOCConfig
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -122,15 +154,62 @@ def load_app_config(path: str) -> AppConfig:
         "poc_bonus": 10,
     }
     impact_defaults.update(impact_raw)
+    sigma_raw = raw.get("sigma", {})
+    if not isinstance(sigma_raw, dict):
+        raise ValueError("sigma must be a mapping")
+    sigma_defaults = {
+        "output_format": "yaml",
+        "max_rules_per_article": 3,
+        "enable_validation": True,
+        "drop_invalid_rules": True,
+        "target_backends": [],
+    }
+    sigma_defaults.update(sigma_raw)
+    update_raw = raw.get("update_strategy", {})
+    if not isinstance(update_raw, dict):
+        raise ValueError("update_strategy must be a mapping")
+    update_defaults = {
+        "enable_issue_update": True,
+        "match_order": ["source_url", "cve", "title_content_similarity"],
+        "update_mode": "merge",
+        "min_score_delta_for_comment": 10,
+    }
+    update_defaults.update(update_raw)
+    ioc_raw = raw.get("ioc", {})
+    if not isinstance(ioc_raw, dict):
+        raise ValueError("ioc must be a mapping")
+    ioc_defaults = {
+        "enable_regex_extraction": True,
+        "dedupe_case_insensitive": True,
+        "max_items_per_type": 200,
+    }
+    ioc_defaults.update(ioc_raw)
+    confidence_raw = raw.get("confidence_scoring", {})
+    if not isinstance(confidence_raw, dict):
+        raise ValueError("confidence_scoring must be a mapping")
+    confidence_defaults = {
+        "base": 40,
+        "source_reputation_bonus": 15,
+        "cve_present_bonus": 15,
+        "evidence_count_bonus": 10,
+        "has_poc_bonus": 10,
+        "in_the_wild_bonus": 15,
+        "max_score": 100,
+        "source_reputation": {},
+    }
+    confidence_defaults.update(confidence_raw)
     return AppConfig(
         jira=JiraConfig(**raw["jira"]),
         llm=LLMConfig(**raw["llm"]),
         rss=RSSConfig(**raw["rss"]),
-        sigma=SigmaConfig(**raw["sigma"]),
+        sigma=SigmaConfig(**sigma_defaults),
         runtime=RuntimeConfig(**raw["runtime"]),
         retry=RetryConfig(**raw["retry"]),
         dedupe=DedupeConfig(**dedupe_defaults),
         impact_scoring=ImpactScoringConfig(**impact_defaults),
+        confidence_scoring=ConfidenceScoringConfig(**confidence_defaults),
+        update_strategy=UpdateStrategyConfig(**update_defaults),
+        ioc=IOCConfig(**ioc_defaults),
     )
 
 
