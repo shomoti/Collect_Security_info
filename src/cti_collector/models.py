@@ -34,9 +34,14 @@ REQUIRED_TOP_LEVEL = {
     "impact_score",
     "impact_score_factors",
     "confidence",
+    "confidence_score",
+    "confidence_factors",
     "evidence",
     "sigma_rules",
 }
+
+
+IOC_REQUIRED_KEYS = {"ips", "domains", "urls", "hashes", "emails", "files", "registry", "mutexes"}
 
 
 def validate_llm_output(payload: dict[str, Any], allowed_tags: set[str]) -> ValidationResult:
@@ -65,6 +70,22 @@ def validate_llm_output(payload: dict[str, Any], allowed_tags: set[str]) -> Vali
     score = payload.get("impact_score")
     if not isinstance(score, int) or not (0 <= score <= 100):
         errors.append("impact_score must be int 0..100")
+
+    confidence_score = payload.get("confidence_score")
+    if not isinstance(confidence_score, int) or not (0 <= confidence_score <= 100):
+        errors.append("confidence_score must be int 0..100")
+
+    iocs = payload.get("iocs")
+    if not isinstance(iocs, dict):
+        errors.append("iocs must be object")
+    else:
+        missing_ioc_keys = IOC_REQUIRED_KEYS - set(iocs.keys())
+        if missing_ioc_keys:
+            errors.append(f"iocs missing keys: {sorted(missing_ioc_keys)}")
+        for key in IOC_REQUIRED_KEYS:
+            value = iocs.get(key, [])
+            if not isinstance(value, list):
+                errors.append(f"iocs.{key} must be list")
 
     sigma_rules = payload.get("sigma_rules", [])
     if not isinstance(sigma_rules, list) or len(sigma_rules) < 1:
