@@ -22,6 +22,8 @@ def _valid_payload() -> dict:
         "impact_score": 70,
         "impact_score_factors": [{"factor": "public exploit", "weight": 20, "reason": "PoC exists"}],
         "confidence": "high",
+        "confidence_score": 80,
+        "confidence_factors": [{"factor": "source", "weight": 20, "reason": "trusted"}],
         "evidence": [{"claim": "PoC available", "basis": "article text"}],
         "sigma_rules": [{"title": "Rule1", "logsource": {"product": "windows"}, "detection": {"selection": {"EventID": 1}}, "condition": "selection"}],
     }
@@ -59,3 +61,11 @@ def test_validate_llm_output_rejects_invalid_cve_and_score() -> None:
     assert not result.ok
     assert any("invalid CVEs" in e for e in result.errors)
     assert any("impact_score" in e for e in result.errors)
+
+
+def test_validate_llm_output_rejects_invalid_iocs() -> None:
+    payload = _valid_payload()
+    payload["iocs"] = {"ips": "1.1.1.1"}
+    result = validate_llm_output(payload, {"plat_windows", "type_vuln"})
+    assert not result.ok
+    assert any("iocs missing keys" in e for e in result.errors)
