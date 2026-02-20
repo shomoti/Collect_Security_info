@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from cti_collector.pipeline import run_daily
 from cti_collector.pipeline import _normalize_llm_result
+from cti_collector.pipeline import _normalize_feedback_verdict
 from cti_collector.rss import Article
 
 
@@ -64,6 +65,15 @@ def _make_config(tmp_path):
             in_the_wild_bonus=15,
             max_score=100,
             source_reputation={},
+        ),
+        feedback_learning=SimpleNamespace(
+            enable=False,
+            verdict_field_id="",
+            useful_values=["useful", "keep", "high_value"],
+            noise_values=["noise", "discard", "low_value"],
+            min_events=10,
+            source_weight_step=3,
+            max_abs_source_weight=20,
         ),
         update_strategy=SimpleNamespace(
             enable_issue_update=True,
@@ -540,3 +550,56 @@ def test_run_daily_updates_existing_intel_by_source_url(monkeypatch, tmp_path) -
     assert stats.updated == 1
     assert stats.created == 0
     assert len(jira.updated) == 1
+
+
+def test_normalize_llm_result_applies_feedback_source_bias() -> None:
+    article = Article(
+        source="CISA",
+        title="Advisory",
+        url="https://example.com/c",
+        published_at="2026-02-19",
+        summary="s",
+        content="c",
+        content_hash="h3",
+    )
+    normalized = _normalize_llm_result(
+        llm_result={"tags": ["type_vuln"], "sigma_rules": ["rule text"], "confidence_score": 20},
+        article=article,
+        allowed_tags={"type_vuln", "plat_windows"},
+        sigma_max_rules=2,
+        impact_scoring=SimpleNamespace(
+            base_score=20,
+            vulnerability_bonus=20,
+            exploit_bonus=30,
+            cve_per_item_bonus=5,
+            cve_max_bonus=20,
+            in_the_wild_bonus=25,
+            poc_bonus=10,
+        ),
+        ioc_config=SimpleNamespace(
+            enable_regex_extraction=True,
+            dedupe_case_insensitive=True,
+            max_items_per_type=200,
+        ),
+        confidence_scoring=SimpleNamespace(
+            base=40,
+            source_reputation_bonus=15,
+            cve_present_bonus=15,
+            evidence_count_bonus=10,
+            has_poc_bonus=10,
+            in_the_wild_bonus=15,
+            max_score=100,
+            source_reputation={},
+        ),
+        learned_source_bias={"CISA": 12},
+    )
+
+    assert normalized["confidence_score"] >= 52
+    assert any(f["factor"] == "analyst_feedback_bias" for f in normalized["confidence_factors"])
+
+
+def test_normalize_feedback_verdict_supports_jira_select_shapes() -> None:
+    useful_values = {"useful"}
+    noise_values = {"noise"}
+    assert _normalize_feedback_verdict({"value": "useful"}, useful_values, noise_values) == "useful"
+    assert _normalize_feedback_verdict([{"name": "noise"}], useful_values, noise_values) == "noise"
