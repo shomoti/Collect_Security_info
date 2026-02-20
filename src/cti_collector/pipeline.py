@@ -169,6 +169,7 @@ def _infer_confidence(
     exploit_status: str,
     evidence: list[dict[str, Any]],
     scoring: ConfidenceScoringConfig,
+    learned_source_bias: dict[str, int] | None = None,
 ) -> tuple[int, str, list[dict[str, Any]]]:
     score = scoring.base
     factors: list[dict[str, Any]] = [{"factor": "base", "weight": scoring.base, "reason": "baseline confidence"}]
@@ -195,6 +196,11 @@ def _infer_confidence(
     if exploit_status == "in_the_wild":
         score += scoring.in_the_wild_bonus
         factors.append({"factor": "in_the_wild", "weight": scoring.in_the_wild_bonus, "reason": "active exploitation reported"})
+
+    source_bias = _to_int((learned_source_bias or {}).get(article.source, 0), 0)
+    if source_bias:
+        score += source_bias
+        factors.append({"factor": "analyst_feedback_bias", "weight": source_bias, "reason": f"source={article.source}"})
 
     score = max(0, min(scoring.max_score, score))
     if score >= 75:
@@ -260,6 +266,7 @@ def _normalize_llm_result(
     impact_scoring: ImpactScoringConfig,
     ioc_config: IOCConfig,
     confidence_scoring: ConfidenceScoringConfig,
+    learned_source_bias: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     data = dict(llm_result) if isinstance(llm_result, dict) else {}
     article_text = f"{article.title}\n{article.summary}\n{article.content}"
@@ -323,6 +330,7 @@ def _normalize_llm_result(
         exploit_status=exploit_status,
         evidence=evidence,
         scoring=confidence_scoring,
+        learned_source_bias=learned_source_bias,
     )
     confidence_text = str(data.get("confidence") or confidence_level).lower()
     if confidence_text not in {"low", "medium", "high"}:
@@ -474,6 +482,56 @@ def _apply_sigma_quality_gate(config: AppConfig, payload: dict[str, Any]) -> lis
     return gate_errors
 
 
+def _normalize_feedback_verdict(raw_value: Any, useful_values: set[str], noise_values: set[str]) -> str | None:
+    candidates: list[str] = []
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, str):
+        candidates.append(raw_value)
+    elif isinstance(raw_value, dict):
+        for key in ("value", "name", "id"):
+            value = raw_value.get(key)
+            if value is not None:
+                candidates.append(str(value))
+    elif isinstance(raw_value, list):
+        for item in raw_value:
+            if isinstance(item, dict):
+                for key in ("value", "name", "id"):
+                    value = item.get(key)
+                    if value is not None:
+                        candidates.append(str(value))
+            elif item is not None:
+                candidates.append(str(item))
+    else:
+        candidates.append(str(raw_value))
+
+    normalized = [v.strip().lower() for v in candidates if v and v.strip()]
+    for value in normalized:
+        if value in useful_values:
+            return "useful"
+    for value in normalized:
+        if value in noise_values:
+            return "noise"
+    return None
+
+
+def _build_source_feedback_bias(
+    store: StateStore,
+    min_events: int,
+    source_weight_step: int,
+    max_abs_source_weight: int,
+) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for stat in store.get_feedback_stats_by_source():
+        if stat.total_count < min_events:
+            continue
+        raw_weight = (stat.useful_count - stat.noise_count) * source_weight_step
+        weight = max(-max_abs_source_weight, min(max_abs_source_weight, raw_weight))
+        if weight:
+            out[stat.source] = weight
+    return out
+
+
 def _add_duplicate_comment(
     logger: logging.Logger,
     jira: JiraClient,
@@ -580,6 +638,15 @@ def run_daily(config: AppConfig, allowed_tags: set[str], prompt_path: str, enabl
     store = StateStore(config.runtime.db_path)
 
     try:
+        learned_source_bias: dict[str, int] = {}
+        if config.feedback_learning.enable:
+            learned_source_bias = _build_source_feedback_bias(
+                store=store,
+                min_events=config.feedback_learning.min_events,
+                source_weight_step=config.feedback_learning.source_weight_step,
+                max_abs_source_weight=config.feedback_learning.max_abs_source_weight,
+            )
+
         articles = collect_articles(
             sources=config.rss.sources,
             timeout_seconds=config.rss.timeout_seconds,
@@ -727,6 +794,7 @@ def run_daily(config: AppConfig, allowed_tags: set[str], prompt_path: str, enabl
                     impact_scoring=config.impact_scoring,
                     ioc_config=config.ioc,
                     confidence_scoring=config.confidence_scoring,
+                    learned_source_bias=learned_source_bias,
                 )
 
                 sigma_errors = _apply_sigma_quality_gate(config, llm_result)
@@ -744,6 +812,7 @@ def run_daily(config: AppConfig, allowed_tags: set[str], prompt_path: str, enabl
                         impact_scoring=config.impact_scoring,
                         ioc_config=config.ioc,
                         confidence_scoring=config.confidence_scoring,
+                        learned_source_bias=learned_source_bias,
                     )
                     sigma_errors = _apply_sigma_quality_gate(config, llm_result)
                     validation = validate_llm_output(llm_result, allowed_tags)
@@ -776,11 +845,26 @@ def run_daily(config: AppConfig, allowed_tags: set[str], prompt_path: str, enabl
                         )
 
                 if matched_intel_key and config.update_strategy.enable_issue_update:
+                    issue_field_ids = list(config.jira.fields.get("intel", {}).values())
+                    if config.feedback_learning.enable and config.feedback_learning.verdict_field_id:
+                        issue_field_ids.append(config.feedback_learning.verdict_field_id)
                     issue_fields = jira.get_issue_fields(
                         matched_intel_key,
-                        list(config.jira.fields.get("intel", {}).values()),
+                        issue_field_ids,
                     )
                     existing_intel = _extract_intel_values_from_issue(issue_fields, config.jira.fields.get("intel", {}))
+                    if config.feedback_learning.enable and config.feedback_learning.verdict_field_id:
+                        verdict_value = issue_fields.get(config.feedback_learning.verdict_field_id)
+                        useful_values = {v.strip().lower() for v in config.feedback_learning.useful_values}
+                        noise_values = {v.strip().lower() for v in config.feedback_learning.noise_values}
+                        normalized_verdict = _normalize_feedback_verdict(verdict_value, useful_values, noise_values)
+                        source_value = str(existing_intel.get("source") or article.source).strip() or article.source
+                        if normalized_verdict:
+                            store.upsert_feedback(
+                                issue_key=matched_intel_key,
+                                source=source_value,
+                                verdict=normalized_verdict,
+                            )
                     old_score = _to_int(existing_intel.get("impact_score"), 0)
                     old_cves = [str(x) for x in _ensure_list(existing_intel.get("cve_list"))]
                     final_intel_fields = intel_fields

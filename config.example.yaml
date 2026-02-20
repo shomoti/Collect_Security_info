@@ -101,3 +101,12 @@ confidence_scoring:
   in_the_wild_bonus: 15
   max_score: 100
   source_reputation: {}
+
+feedback_learning:
+  enable: false
+  verdict_field_id: ""
+  useful_values: ["useful", "keep", "high_value"]
+  noise_values: ["noise", "discard", "low_value"]
+  min_events: 10
+  source_weight_step: 3
+  max_abs_source_weight: 20

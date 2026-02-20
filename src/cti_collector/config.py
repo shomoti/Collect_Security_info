@@ -106,6 +106,17 @@ class ConfidenceScoringConfig:
 
 
 @dataclass
+class FeedbackLearningConfig:
+    enable: bool
+    verdict_field_id: str
+    useful_values: list[str]
+    noise_values: list[str]
+    min_events: int
+    source_weight_step: int
+    max_abs_source_weight: int
+
+
+@dataclass
 class AppConfig:
     jira: JiraConfig
     llm: LLMConfig
@@ -118,6 +129,7 @@ class AppConfig:
     confidence_scoring: ConfidenceScoringConfig
     update_strategy: UpdateStrategyConfig
     ioc: IOCConfig
+    feedback_learning: FeedbackLearningConfig
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -198,6 +210,19 @@ def load_app_config(path: str) -> AppConfig:
         "source_reputation": {},
     }
     confidence_defaults.update(confidence_raw)
+    feedback_raw = raw.get("feedback_learning", {})
+    if not isinstance(feedback_raw, dict):
+        raise ValueError("feedback_learning must be a mapping")
+    feedback_defaults = {
+        "enable": False,
+        "verdict_field_id": "",
+        "useful_values": ["useful", "keep", "high_value"],
+        "noise_values": ["noise", "discard", "low_value"],
+        "min_events": 10,
+        "source_weight_step": 3,
+        "max_abs_source_weight": 20,
+    }
+    feedback_defaults.update(feedback_raw)
     return AppConfig(
         jira=JiraConfig(**raw["jira"]),
         llm=LLMConfig(**raw["llm"]),
@@ -210,6 +235,7 @@ def load_app_config(path: str) -> AppConfig:
         confidence_scoring=ConfidenceScoringConfig(**confidence_defaults),
         update_strategy=UpdateStrategyConfig(**update_defaults),
         ioc=IOCConfig(**ioc_defaults),
+        feedback_learning=FeedbackLearningConfig(**feedback_defaults),
     )
 
 

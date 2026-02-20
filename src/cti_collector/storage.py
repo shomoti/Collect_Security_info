@@ -20,6 +20,14 @@ class StoredRecord:
     update_count: int
 
 
+@dataclass
+class SourceFeedbackStats:
+    source: str
+    useful_count: int
+    noise_count: int
+    total_count: int
+
+
 class StateStore:
     def __init__(self, db_path: str) -> None:
         self.conn = sqlite3.connect(db_path)
@@ -49,6 +57,17 @@ class StateStore:
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_content_hash ON processed_articles(content_hash)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_source_title ON processed_articles(source, title_norm)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_canonical_key ON processed_articles(canonical_key)")
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS analyst_feedback (
+                issue_key TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                verdict TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_source ON analyst_feedback(source)")
         self.conn.commit()
 
     def _ensure_column(self, column_name: str, definition: str) -> None:
@@ -140,3 +159,40 @@ class StateStore:
 
     def close(self) -> None:
         self.conn.close()
+
+    def upsert_feedback(self, issue_key: str, source: str, verdict: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO analyst_feedback (issue_key, source, verdict, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(issue_key) DO UPDATE SET
+              source = excluded.source,
+              verdict = excluded.verdict,
+              updated_at = excluded.updated_at
+            """,
+            (issue_key, source, verdict, now),
+        )
+        self.conn.commit()
+
+    def get_feedback_stats_by_source(self) -> list[SourceFeedbackStats]:
+        rows = self.conn.execute(
+            """
+            SELECT
+              source,
+              SUM(CASE WHEN verdict = 'useful' THEN 1 ELSE 0 END) AS useful_count,
+              SUM(CASE WHEN verdict = 'noise' THEN 1 ELSE 0 END) AS noise_count,
+              COUNT(*) AS total_count
+            FROM analyst_feedback
+            GROUP BY source
+            """
+        ).fetchall()
+        return [
+            SourceFeedbackStats(
+                source=str(r[0]),
+                useful_count=int(r[1] or 0),
+                noise_count=int(r[2] or 0),
+                total_count=int(r[3] or 0),
+            )
+            for r in rows
+        ]
