@@ -63,6 +63,7 @@ python scripts/run_daily.py --config config.yaml --tags tag_dictionary.yaml --pr
 - `update_strategy`: 既存課題更新の挙動
 - `ioc`: 正規表現抽出、重複排除、種別ごとの最大件数
 - `confidence_scoring`: confidence算出の重み調整
+- `feedback_learning`: アナリスト判定（useful/noise）をもとにソース別confidence補正を学習
 - `sigma.drop_invalid_rules`, `sigma.target_backends`: Sigma品質ゲートの挙動
 - `jira.fields.intel.confidence_score`: confidenceスコアのJiraマッピング
 
@@ -75,3 +76,8 @@ python scripts/run_daily.py --config config.yaml --tags tag_dictionary.yaml --pr
 - MISP連携はMVP範囲外です。
 - Sigma実行時検証では `title`, `logsource`, `detection`, `condition` を必須キーとして確認します。
 - `sigma.drop_invalid_rules=true` の場合、無効なSigmaルールはJira連携前に除外されます。
+
+## アナリストフィードバック学習（任意）
+- `feedback_learning.enable=true` の場合、更新対象Intel課題から `feedback_learning.verdict_field_id` の値を読み取り、`state.db` 内部に判定を蓄積します。
+- 判定値は `useful_values` / `noise_values` で正規化され、ソース単位の集計結果から `confidence_score` に補正値（`analyst_feedback_bias`）を加算します。
+- 補正は `min_events` 件以上のデータがあるソースのみ対象です。過学習防止のため、補正幅は `max_abs_source_weight` でクリップされます。
